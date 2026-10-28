@@ -81,6 +81,26 @@ Keyboard and mouse controls are experimental. WASD moves, IJKL controls the came
 
 The renderer targets the WebGPU API and WGSL so the same general renderer and shader backend can be used by native wgpu and by browser WebGPU experiments rather than maintaining wholly separate graphics implementations. On Windows, wgpu-native translates this API to an available native backend, such as Vulkan or Direct3D 12; choosing WebGPU does not mean the desktop game runs inside a browser. It also has portability and validation tradeoffs, and translation, pipeline compilation and API overhead still require optimization. The root `build.bat` described here builds the **Windows native** package; browser functionality and packaging are not promised or validated by that launcher.
 
+### Intel Arc Graphics (Windows 11)
+
+SkyboundTOTK includes dedicated support and mitigations for Intel Arc GPUs (Alchemist A-Series like A770/A750/A380 and Battlemage B-Series):
+
+- **Automatic hardware detection:** The renderer identifies Intel Arc adapters (`vendorID 0x8086`) and applies architecture-specific shader compilation profiles and driver mitigations.
+- **Driver and swapchain stabilization:** Redundant swapchain reconfigurations are prevented to avoid Vulkan/D3D12 device lost errors (`0xc000041d`) during window resize, minimize, or focus changes on Windows 11.
+- **Shader precision & math mitigations:** Fast-math optimizations that cause half-float NaN/overflow issues on Intel Execution Units are automatically disabled, and floating-point clamping is sanitized (`OpFMax`+`OpFMin`).
+- **Dual-source blending bypass:** Hardware dual-source blending requests are bypassed by default to avoid Intel Arc Naga shader translation crashes, utilizing the renderer's built-in blend approximation.
+- **Xe Cacheline alignment:** Storage buffer offset alignment is matched to 64 bytes for Intel Xe cacheline efficiency.
+
+**Recommended Intel Arc Settings:**
+- **Resizable BAR (ReBAR):** Ensure *Above 4G Decoding* and *Resizable BAR* are enabled in your motherboard BIOS. Intel Arc architecture relies heavily on ReBAR for stable frame rates and memory streaming.
+- **Backend Selection:** If you experience driver issues with the default backend, you can switch between Vulkan and Direct3D 12 by setting the environment variable in your command prompt before launching:
+  ```cmd
+  set RX_BACKEND=vulkan
+  :: or
+  set RX_BACKEND=dx12
+  dist\SkyboundTOTK\SkyboundTOTK.exe
+  ```
+
 ## Known issues and limitations
 
 These are reports and investigation notes, not a complete compatibility list. Some were observed in earlier TOTKPort builds rather than independently reproduced in standalone Skybound.

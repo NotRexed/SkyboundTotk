@@ -363,6 +363,7 @@ struct Device {
     WGPULimits limits{};
     bool bc = false, float32_filterable = false, depth32_stencil8 = false, norm16 = false, depth_clip_control = false,
          early_depth_test = false, timestamps = false;
+    bool is_intel = false, is_intel_arc = false;
     std::string description;
 };
 extern Device dev;

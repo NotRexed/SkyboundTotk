@@ -144,8 +144,9 @@ const char* backend_name(WGPUBackendType t) {
     }
 }
 
-void configure_surface(uint32_t w, uint32_t h) {
+void configure_surface(uint32_t w, uint32_t h, bool force = false) {
     if (!surface || !w || !h) return;
+    if (!force && w == surface_w && h == surface_h) return; // avoid redundant surface reconfigurations on Intel Arc
     WGPUSurfaceConfiguration c{};
     c.device = dev.device;
     c.format = surface_format;
@@ -387,6 +388,27 @@ bool init_device(HWND hwnd) {
     char desc[256];
     std::snprintf(desc, sizeof desc, "%s (%s)", str(info.device).c_str(), backend_name(info.backendType));
     dev.description = desc;
+
+    std::string dev_name = str(info.device);
+    std::string vendor_name = str(info.vendor);
+    auto to_lower = [](std::string s) {
+        for (char& c : s) c = (char)std::tolower((unsigned char)c);
+        return s;
+    };
+    std::string dev_lower = to_lower(dev_name);
+    std::string vendor_lower = to_lower(vendor_name);
+
+    dev.is_intel = (info.vendorID == 0x8086) || (vendor_lower.find("intel") != std::string::npos) ||
+                   (dev_lower.find("intel") != std::string::npos);
+    dev.is_intel_arc = dev.is_intel && (dev_lower.find("arc") != std::string::npos ||
+                                        (info.deviceID >= 0x5690 && info.deviceID <= 0x56cf));
+
+    if (dev.is_intel) {
+        hos_log("rx: Intel GPU detected: %s (vendorID %#x, deviceID %#x)", dev_name.c_str(), info.vendorID, info.deviceID);
+        if (dev.is_intel_arc) {
+            hos_log("rx: Intel Arc GPU detected: enabling specialized driver mitigations for Windows 11");
+        }
+    }
     wgpuAdapterInfoFreeMembers(info);
 
     // what the adapter has of what we use
@@ -395,8 +417,13 @@ bool init_device(HWND hwnd) {
         WGPUFeatureName_Depth32FloatStencil8,  WGPUFeatureName_RG11B10UfloatRenderable,
         WGPUFeatureName_DepthClipControl,      WGPUFeatureName_IndirectFirstInstance,
         WGPUFeatureName_Float32Blendable,      WGPUFeatureName_TextureFormatsTier1,
-        WGPUFeatureName_DualSourceBlending,    WGPUFeatureName_ClipDistances,
+        WGPUFeatureName_ClipDistances,
     };
+    // DualSourceBlending: avoid requesting on Intel Arc by default due to driver/Naga layout compiler issues,
+    // unless explicitly forced via RX_INTEL_DUAL_SOURCE=1 (dual-source is already approximated in rx_draw)
+    if (!dev.is_intel_arc || env_flag("RX_INTEL_DUAL_SOURCE")) {
+        want.push_back(WGPUFeatureName_DualSourceBlending);
+    }
     std::vector<WGPUFeatureName> have;
     for (auto f : want)
         if (wgpuAdapterHasFeature(dev.adapter, f)) have.push_back(f);
@@ -452,6 +479,8 @@ bool init_device(HWND hwnd) {
     // RX_SSBO_ALIGN=<bytes>: a coarser storage offset alignment (the browser's 256, to test its paths natively)
     if (const char* a = getenv("RX_SSBO_ALIGN"); a && atoi(a) > (int)dev.limits.minStorageBufferOffsetAlignment)
         dev.limits.minStorageBufferOffsetAlignment = (uint32_t)atoi(a);
+    if (dev.is_intel_arc && dev.limits.minStorageBufferOffsetAlignment < 64)
+        dev.limits.minStorageBufferOffsetAlignment = 64; // align with Xe cachelines
     hos_log("rx: storage buffer offset alignment %u, uniform %u, vertex buffers %u", dev.limits.minStorageBufferOffsetAlignment,
             dev.limits.minUniformBufferOffsetAlignment, dev.limits.maxVertexBuffers);
 
@@ -2138,7 +2167,7 @@ void surface_present(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww,
         static int logged;
         if (logged++ < 8) hos_log("rx: no surface texture (status %d)", (int)st.status);
         if (st.texture) wgpuTextureRelease(st.texture);
-        configure_surface(surface_w, surface_h);
+        configure_surface(surface_w, surface_h, true);
         if (view) wgpuTextureViewRelease(view);
         return;
     }

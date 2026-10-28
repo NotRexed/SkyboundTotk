@@ -35,6 +35,16 @@
 namespace rx {
 namespace {
 
+Shader::Profile current_shader_profile() {
+    Shader::Profile profile{};
+    if (dev.is_intel || dev.is_intel_arc) {
+        profile.need_fastmath_off = true;      // Prevent NaN/Inf precision issues on Intel Arc ALUs
+        profile.has_broken_spirv_clamp = true; // Intel driver clamp workaround
+        profile.has_gl_bool_ref_bug = true;    // Workaround Intel boolean reference bugs
+    }
+    return profile;
+}
+
 Shader::TextureType convert_texture_type(const Tegra::Texture::TICEntry& entry) {
     using T = Tegra::Texture::TextureType;
     switch (entry.texture_type) {
@@ -527,7 +537,7 @@ ShaderModule* compute_module(const ComputeLaunch& l, const std::array<uint8_t, 6
         host.support_int64 = false;
         host.min_ssbo_alignment = dev.limits.minStorageBufferOffsetAlignment;
         t.program = Shader::Maxwell::TranslateProgram(t.insts, t.blocks, env, cfg, host);
-        Shader::Profile profile{};
+        Shader::Profile profile = current_shader_profile();
         Shader::RuntimeInfo rt{};
         Shader::Backend::Bindings b{};
         if (ssbo_alias) Shader::Backend::WGSL::ssbo_alias_next = *ssbo_alias;
@@ -663,7 +673,7 @@ ProgramPair* build_pair(const Channel& ch, const Regs& r, uint64_t vs_key, uint6
             if (auto it = pairs.find(key); it != pairs.end()) return it->second->failed ? nullptr : it->second.get();
             loads = vi.loads;
         }
-        Shader::Profile profile{};
+        Shader::Profile profile = current_shader_profile();
         Shader::Backend::WGSL::Options options{};
         Shader::RuntimeInfo vs_rt{};
         // VertexB consumes vertex fetch, not an earlier shader. An empty mask makes the backend replace every
@@ -1296,7 +1306,7 @@ ShaderModule* nvn_compute_module(const NvnState& s, const std::array<uint8_t, 64
         NvnEnvironment env{s, *code, Shader::Stage::Compute};
         auto t = nvn_translate(env, false);
         for (uint32_t off : env.c2_reads) var->answers.push_back({off, nvn_type_at(s, 5, off)});
-        Shader::Profile profile{};
+        Shader::Profile profile = current_shader_profile();
         Shader::RuntimeInfo rt{};
         Shader::Backend::Bindings b{};
         Shader::Backend::WGSL::ssbo_alias_next = alias;
@@ -1460,7 +1470,7 @@ ProgramPair* nvn_programs_uncached(const NvnState& s, const uint8_t out_types[8]
         var->plan_sig = nvn_plan_sig(plan);
         auto pair = std::make_unique<ProgramPair>();
         pair->has_fs = fs != nullptr;
-        Shader::Profile profile{};
+        Shader::Profile profile = current_shader_profile();
         Shader::Backend::WGSL::Options options{};
         Shader::RuntimeInfo vs_rt{};
         vs_rt.previous_stage_stores.mask.set();
