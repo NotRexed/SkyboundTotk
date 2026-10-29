@@ -7,6 +7,7 @@
    Mouse: a click in the window captures the mouse (hidden, kept in the window) and its motion turns the camera
    (nn_hid.c reads it as the right stick); Esc or leaving the window releases it. */
 #include "hos.h"
+#include "perf_menu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -197,6 +198,8 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (renderer && !mouse_captured) mouse_capture(w, 1);
         return 0;
     case WM_KEYDOWN:
+        if (wp == VK_F1) mouse_capture(w, 0);
+        if (perf_menu_key((int)wp, w)) return 0;
         if (wp == VK_ESCAPE) mouse_capture(w, 0);
         if (wp == VK_F11 && !(lp & (1 << 30))) set_fullscreen(w, !fullscreen);
         if (renderer && wp >= VK_F6 && wp <= VK_F10 && !(lp & (1 << 30))) {   /* the present settings (F6-F10) */
@@ -208,6 +211,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             }
             present_notice_until = hos_now_ns() + 4000000000LL;
             update_title();
+            perf_menu_sync();
         }
         return 0;
     case WM_DPICHANGED:
@@ -320,6 +324,7 @@ static DWORD WINAPI display_main(void *p) {
     RAWINPUTDEVICE rid = {1, 2, 0, hwnd};   /* generic desktop mouse: WM_INPUT while the window is in front */
     RegisterRawInputDevices(&rid, 1, sizeof rid);
     renderer = rx_start(hwnd);
+    perf_menu_init(hwnd);   /* F1 overlay menu */
     SetTimer(hwnd, 1, renderer ? 250 : 33, NULL);
     MSG m;
     while (GetMessageA(&m, NULL, 0, 0) > 0) {

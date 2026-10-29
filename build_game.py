@@ -24,6 +24,46 @@ def fail(message):
     raise SystemExit("ERROR: " + message)
 
 
+def safe_job_count(ram_per_job_gb: float = 3.5) -> int:
+    """Return a parallel-job count that keeps RAM under ~80% of physical memory.
+
+    Each clang -O3 job on TOTK's giant lifted C chunks consumes 3-8 GB of RAM.
+    Running all 22 logical threads at once on a 16 GB machine causes an OOM
+    crash/BSOD.  We cap at floor(0.80 * total_ram / ram_per_job_gb), clamped
+    to [1, cpu_count].  Override with the RX_JOBS environment variable.
+    """
+    override = os.environ.get("RX_JOBS")
+    if override:
+        return max(1, int(override))
+    try:
+        import ctypes
+        class _MEMSTATEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength",               ctypes.c_ulong),
+                ("dwMemoryLoad",           ctypes.c_ulong),
+                ("ullTotalPhys",           ctypes.c_ulonglong),
+                ("ullAvailPhys",           ctypes.c_ulonglong),
+                ("ullTotalPageFile",       ctypes.c_ulonglong),
+                ("ullAvailPageFile",       ctypes.c_ulonglong),
+                ("ullTotalVirtual",        ctypes.c_ulonglong),
+                ("ullAvailVirtual",        ctypes.c_ulonglong),
+                ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+        stat = _MEMSTATEX()
+        stat.dwLength = ctypes.sizeof(stat)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+        total_gb = stat.ullTotalPhys / (1024 ** 3)
+    except Exception:
+        total_gb = 16.0  # safe fallback
+    usable_gb = total_gb * 0.80
+    jobs = max(1, int(usable_gb / ram_per_job_gb))
+    capped = min(jobs, os.cpu_count() or 1)
+    print(f"[build] RAM-safe job count: {capped} "
+          f"(~{total_gb:.1f} GB total, {ram_per_job_gb} GB/job budget; "
+          f"set RX_JOBS=N to override)")
+    return capped
+
+
 def check_game():
     exefs, romfs = GAME / "exefs", GAME / "romfs"
     for name, expected in EXPECTED_IDS.items():
@@ -126,7 +166,18 @@ def main():
         run(sys.executable, KIT / "build.py", "lift", "totk", "--exefs", exefs,
             "--skip", "subsdk0", "--build", BUILD)
         stamp.write_text(identity + "\n", encoding="ascii")
-    run(sys.executable, KIT / "build.py", "native", "totk", "--build", BUILD, "--wgpu", WGPU)
+
+    # ── RAM-safe parallel compile ─────────────────────────────────────────────
+    # Each clang -O3 job on TOTK's lifted C files uses 3-8 GB of RAM.
+    # Without a cap, all 22 logical cores compile at once → OOM crash on 16 GB.
+    # RX_JOBS overrides; RX_OPT overrides the optimisation level (O1 is faster
+    # to compile; O2/O3 give better runtime performance).
+    jobs = safe_job_count(ram_per_job_gb=3.5)
+    opt  = os.environ.get("RX_OPT", "O3")   # O1 builds faster; O3 is default
+
+    run(sys.executable, KIT / "build.py", "native", "totk",
+        "--build", BUILD, "--wgpu", WGPU,
+        "--opt", opt, "-j", str(jobs))
     package(romfs)
 
 

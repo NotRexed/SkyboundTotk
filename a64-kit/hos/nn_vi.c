@@ -4,6 +4,7 @@
    NVN presents through (below). Vsync is a 60 Hz host thread signaling the display's vsync system event; games pace
    their frames on it. */
 #include "hos.h"
+#include "perf_menu.h"
 #include <string.h>
 #include <stdlib.h>
 #define WIN32_LEAN_AND_MEAN
@@ -82,7 +83,8 @@ static double frame_cap_hz(void) {
 }
 static void frame_limit(void) {
     static int64_t next;
-    const int64_t period = (int64_t)(1e9 / frame_cap_hz());
+    const int64_t override_hz = perf_menu_fps_cap;
+    const int64_t period = override_hz > 0 ? (int64_t)(1e9 / (double)override_hz) : (int64_t)(1e9 / frame_cap_hz());
     int64_t now = hos_now_ns();
     if (next && now < next) {
         hos_sleep_ns(next - now);

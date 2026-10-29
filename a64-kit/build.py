@@ -26,6 +26,40 @@ for sub in ("lift", "hos", "tools"):
     sys.path.insert(0, os.path.join(HERE, sub))
 import toolchain
 
+
+def _safe_job_count(ram_per_job_gb=3.5):
+    """Cap parallel jobs so peak RAM stays under ~80% of physical memory.
+
+    Each clang -O3 job on a large TOTK lifted C file consumes 3-8 GB RAM.
+    Running all logical cores in parallel (22 on Ultra 7 155H) on 16 GB
+    causes an OOM crash.  Override with the RX_JOBS environment variable.
+    """
+    override = os.environ.get("RX_JOBS")
+    if override:
+        return max(1, int(override))
+    try:
+        import ctypes
+        class _MS(ctypes.Structure):
+            _fields_ = [
+                ("dwLength",                ctypes.c_ulong),
+                ("dwMemoryLoad",            ctypes.c_ulong),
+                ("ullTotalPhys",            ctypes.c_ulonglong),
+                ("ullAvailPhys",            ctypes.c_ulonglong),
+                ("ullTotalPageFile",        ctypes.c_ulonglong),
+                ("ullAvailPageFile",        ctypes.c_ulonglong),
+                ("ullTotalVirtual",         ctypes.c_ulonglong),
+                ("ullAvailVirtual",         ctypes.c_ulonglong),
+                ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+        s = _MS()
+        s.dwLength = ctypes.sizeof(s)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(s))
+        total_gb = s.ullTotalPhys / (1024 ** 3)
+    except Exception:
+        total_gb = 16.0
+    jobs = max(1, int(total_gb * 0.80 / ram_per_job_gb))
+    return min(jobs, os.cpu_count() or 1)
+
 RT = os.path.join(HERE, "rt")
 HOS = os.path.join(HERE, "hos")
 GPU = os.path.join(HERE, "gpu")
@@ -770,7 +804,7 @@ def main():
                                 "(0: never; on TOTK it finds only 60 cuts, its giant functions are loops end to end)")
         if name == "web":
             s.add_argument("--opt", default="O2")
-            s.add_argument("-j", "--jobs", type=int, default=os.cpu_count())
+            s.add_argument("-j", "--jobs", type=int, default=_safe_job_count())
             s.add_argument("--lifted-only", action="store_true", help="compile the lifted code and stop")
             s.add_argument("--guest-mb", type=int, default=3456, help="the guest window (wasm memory below the host's; hos_mem.c sizes the game's heap to leave its regions room)")
         if name == "native":
@@ -779,7 +813,7 @@ def main():
             # 66.7 -> 69.7 fps, ahead in each of 3 interleaved rounds, 2026-10-21; exe +11 MB)
             s.add_argument("--opt", default="O3", help="optimization of the lifted code (O1 builds faster)")
             s.add_argument("--debug", action="store_true", help="debug info for the lifted code too")
-            s.add_argument("-j", "--jobs", type=int, default=os.cpu_count())
+            s.add_argument("-j", "--jobs", type=int, default=_safe_job_count())
             s.add_argument("--wgpu", help="a wgpu-native release (include/, lib/): builds the WebGPU renderer")
             s.add_argument("-o", "--output", help="the executable's name (default: the game's; e.g. to link while it runs)")
         if name == "run":

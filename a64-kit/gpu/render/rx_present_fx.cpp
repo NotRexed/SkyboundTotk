@@ -436,3 +436,17 @@ extern "C" const char* rx_present_hotkey(int key) {
                   s.ultrawide ? (hos_view_aspect > 0 ? "on" : "on (the window is 16:9)") : "off");
     return line;
 }
+
+extern "C" void rx_present_get_settings(int* fsr, int* sharpness_idx, int* framegen, int* ultrawide, int* stretch) {
+    using namespace rx;
+    Settings s = current_settings();
+    if (fsr) *fsr = s.fsr ? 1 : 0;
+    if (framegen) *framegen = s.framegen ? 1 : 0;
+    if (ultrawide) *ultrawide = s.ultrawide ? 1 : 0;
+    if (stretch) *stretch = s.stretch ? 1 : 0;
+    if (sharpness_idx) {
+        int i = 0;
+        while (i < 5 && kSharpness[i] < s.sharpness - 0.01f) i++;
+        *sharpness_idx = (i < 5) ? i : 4;
+    }
+}

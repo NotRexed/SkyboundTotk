@@ -52,6 +52,7 @@ bool wgpuDevicePoll(WGPUDevice device, bool wait, const void* submission) {
 }
 #endif
 
+extern "C" const char* hos_user_dir;
 namespace rx {
 bool draw_must_run = false;
 bool rt_history_on() { static const bool on = getenv("RX_RT_HISTORY") != nullptr; return on; }
@@ -340,10 +341,25 @@ bool init_device(HWND hwnd) {
 #else
     WGPUInstanceExtras extras{};
     extras.chain.sType = (WGPUSType)WGPUSType_InstanceExtras;
+    std::string be_file;
     const char* be = getenv("RX_BACKEND");
+    if (!be) {
+        std::string bpath = std::string(hos_user_dir ? hos_user_dir : "user") + "/backend.txt";
+        if (FILE* f = fopen(bpath.c_str(), "r")) {
+            char buf[32] = "";
+            if (fscanf(f, "%31s", buf) == 1) {
+                be_file = buf;
+                be = be_file.c_str();
+            }
+            fclose(f);
+        }
+    }
+    if (be && !_stricmp(be, "dx12")) {
+        hos_log("rx: Direct3D 12 requested, but this build of wgpu-native was compiled only for Vulkan. Falling back to Vulkan.");
+        be = "vulkan";
+    }
     extras.backends = !be                           ? WGPUInstanceBackend_Primary
                       : !_stricmp(be, "vulkan")     ? WGPUInstanceBackend_Vulkan
-                      : !_stricmp(be, "dx12")       ? WGPUInstanceBackend_DX12
                       : !_stricmp(be, "gl")         ? WGPUInstanceBackend_GL
                                                     : WGPUInstanceBackend_Primary;
     if (getenv("RX_VALIDATION")) extras.flags = WGPUInstanceFlag_Validation | WGPUInstanceFlag_Debug;
