@@ -380,8 +380,8 @@ static void npad_states(Ctx *c) {
     if (connected) read_input(&buttons, stick);
     uint64_t hos_title_input(uint64_t buttons);   /* totk_title.c: the title menu's credits entries */
     if (connected) buttons = hos_title_input(buttons);
-    void hos_frame_step_buttons(uint64_t buttons);   /* nn_vi.c: the ability wheel's frame step */
-    if (connected) hos_frame_step_buttons(buttons);
+    uint64_t hos_frame_step_buttons(uint64_t buttons);   /* nn_vi.c: the frame step of the wheel and quick menus */
+    if (connected) buttons = hos_frame_step_buttons(buttons);
     int64_t s = ++sampling;
     for (int i = 0; i < count; i++) {
         uint64_t e = out + (uint64_t)i * STATE_SIZE;

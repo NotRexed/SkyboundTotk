@@ -363,6 +363,31 @@ bool init_device(HWND hwnd) {
                       : !_stricmp(be, "gl")         ? WGPUInstanceBackend_GL
                                                     : WGPUInstanceBackend_Primary;
     if (getenv("RX_VALIDATION")) extras.flags = WGPUInstanceFlag_Validation | WGPUInstanceFlag_Debug;
+    // wgpu's own log (why a device was lost, driver warnings) into ours: warnings and errors, 400 different ones;
+    // RX_WGPU_LOG=info|debug|trace for more, off for none
+    {
+        const char* lv = getenv("RX_WGPU_LOG");
+        const WGPULogLevel level = !lv                        ? WGPULogLevel_Warn
+                                   : !_stricmp(lv, "off")     ? WGPULogLevel_Off
+                                   : !_stricmp(lv, "error")   ? WGPULogLevel_Error
+                                   : !_stricmp(lv, "info")    ? WGPULogLevel_Info
+                                   : !_stricmp(lv, "debug")   ? WGPULogLevel_Debug
+                                   : !_stricmp(lv, "trace")   ? WGPULogLevel_Trace
+                                                              : WGPULogLevel_Warn;
+        wgpuSetLogCallback(
+            [](WGPULogLevel l, WGPUStringView message, void*) {
+                static std::mutex m;   // (each message once: some warnings come for every pipeline)
+                static std::set<std::string> seen;
+                std::string t = str(message);
+                {
+                    std::lock_guard g(m);
+                    if (seen.size() >= 400 || !seen.insert(t).second) return;
+                }
+                hos_log("wgpu %s: %s", l <= WGPULogLevel_Error ? "error" : l == WGPULogLevel_Warn ? "warning" : "log", t.c_str());
+            },
+            nullptr);
+        wgpuSetLogLevel(level);
+    }
     WGPUInstanceDescriptor id{};
     id.nextInChain = &extras.chain;
     dev.instance = wgpuCreateInstance(&id);
@@ -381,6 +406,30 @@ bool init_device(HWND hwnd) {
     }
 #endif
 
+#if !RX_WEB
+    // RX_ADAPTER=<part of a GPU's name> (e.g. "AMD", "Radeon"): that GPU instead of the high-performance one (a PC
+    // with two GPUs; testing on another vendor's driver). The log lists the GPUs when it is set.
+    if (const char* want = getenv("RX_ADAPTER")) {
+        WGPUInstanceEnumerateAdapterOptions eo{};
+        eo.backends = extras.backends;
+        std::vector<WGPUAdapter> all(wgpuInstanceEnumerateAdapters(dev.instance, &eo, nullptr));
+        wgpuInstanceEnumerateAdapters(dev.instance, &eo, all.data());
+        std::string w = want;
+        for (char& c : w) c = (char)tolower((unsigned char)c);
+        for (WGPUAdapter a : all) {
+            WGPUAdapterInfo ai{};
+            wgpuAdapterGetInfo(a, &ai);
+            std::string name = str(ai.device), lower = name;
+            for (char& c : lower) c = (char)tolower((unsigned char)c);
+            const bool pick = !dev.adapter && lower.find(w) != std::string::npos;
+            hos_log("rx: GPU %s (%s)%s", name.c_str(), backend_name(ai.backendType), pick ? ": chosen (RX_ADAPTER)" : "");
+            wgpuAdapterInfoFreeMembers(ai);
+            if (pick) dev.adapter = a;
+            else wgpuAdapterRelease(a);
+        }
+        if (!dev.adapter) hos_log("rx: no GPU's name contains \"%s\" (RX_ADAPTER): the default one", want);
+    }
+#endif
     WGPURequestAdapterOptions ao{};
     ao.featureLevel = WGPUFeatureLevel_Core;
     ao.powerPreference = WGPUPowerPreference_HighPerformance;
@@ -392,7 +441,7 @@ bool init_device(HWND hwnd) {
         else hos_log("rx: no adapter: %s", str(message).c_str());
     };
     acb.userdata1 = &dev.adapter;
-    wgpuInstanceRequestAdapter(dev.instance, &ao, acb);
+    if (!dev.adapter) wgpuInstanceRequestAdapter(dev.instance, &ao, acb);
     for (int i = 0; i < 5000 && !dev.adapter; i++) {
         wgpuInstanceProcessEvents(dev.instance);
         wait_step();
@@ -506,6 +555,8 @@ bool init_device(HWND hwnd) {
                       WGPUBufferUsage_Uniform | WGPUBufferUsage_Storage | WGPUBufferUsage_Vertex |
                           WGPUBufferUsage_Index);
         create_stream(stream_rw, "rx storage", (RX_WEB ? 16ull : 32ull) << 20, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
+        astc_gpu_on();
+        unswizzle_gpu_on();
         hos_log("rx: WebGPU on %s; %zu optional features; no window (offscreen)", desc, have.size());
         return true;
     }
@@ -549,7 +600,8 @@ bool init_device(HWND hwnd) {
     create_stream(stream_rw, "rx storage", (RX_WEB ? 16ull : 32ull) << 20, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
     pipecache_start();   // (the browser: the pipelines of earlier sessions, made again in the background)
     native_cache_start();   // (natively: the same, rxcache/pipelines.bin next to the exe)
-    astc_gpu_on();   // (its pipeline made here: error scopes belong to the device, not to a thread)
+    astc_gpu_on();   // (the compute passes that are on made here: error scopes belong to the device, not to a thread)
+    unswizzle_gpu_on();
     hos_log("rx: WebGPU on %s; %zu optional features; surface %ux%u format %#x present mode %d", desc, have.size(),
             surface_w, surface_h, (unsigned)surface_format, (int)present_mode);
     return true;

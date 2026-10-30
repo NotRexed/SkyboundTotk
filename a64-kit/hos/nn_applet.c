@@ -1,21 +1,55 @@
 /* nn::oe (applet), nn::account, nn::time, nn::pl, nn::err: what a game asks the system about itself.
-   The answers describe a docked console in English with one user, "Player". */
+   The answers describe a docked console in English (HOS_LANGUAGE / language.txt: another language) with one user,
+   "Player". */
 #include "hos.h"
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <time.h>
-#ifdef __EMSCRIPTEN__
-#include <windows.h>   /* (the browser build: the Microsoft C runtime's time functions) */
-#endif
+#include <windows.h>   /* (the exe's folder; the browser build: the Microsoft C runtime's time functions) */
 
 static int64_t boot_ns;
 
 /* ---- nn::oe ------------------------------------------------------------------------------------------------- */
 HLE(_ZN2nn2oe10InitializeEv) { if (!boot_ns) boot_ns = hos_now_ns(); }
 HLE(_ZN2nn2oe17FinishStartupLogoEv) { hos_log("oe: startup logo finished"); }
-/* GetDesiredLanguage() -> settings::LanguageCode (char[8]) by value */
+/* GetDesiredLanguage() -> settings::LanguageCode (char[8]) by value: the language the game shows. English (US)
+   unless HOS_LANGUAGE or the first line of language.txt beside the exe names one TOTK has (after SkyboundTotk PR 16
+   by sardigital): ja, en-US, en-GB, fr, fr-CA, de, it, es, es-419, nl, ru, ko, zh-CN / zh-Hans, zh-TW / zh-Hant. */
+static const char *desired_language(void) {
+    static char lang[8];
+    if (lang[0]) return lang;
+    static const char *const known[] = {"ja", "en-US", "en-GB", "fr",    "fr-CA", "de",      "it",     "es",
+                                        "es-419", "nl", "ru",   "ko",    "zh-CN", "zh-Hans", "zh-TW", "zh-Hant"};
+    char want[32] = "";
+    const char *from = "the default";
+    if (getenv("HOS_LANGUAGE")) {
+        snprintf(want, sizeof want, "%s", getenv("HOS_LANGUAGE"));
+        from = "HOS_LANGUAGE";
+    } else {
+        char path[300] = "language.txt";
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+        DWORD n = GetModuleFileNameA(NULL, path, 260);
+        while (n > 0 && path[n - 1] != '\\' && path[n - 1] != '/') n--;
+        snprintf(path + n, sizeof path - n, "language.txt");
+#endif
+        FILE *f = fopen(path, "r");
+        if (f) {
+            if (fgets(want, sizeof want, f)) from = "language.txt";
+            fclose(f);
+        }
+    }
+    want[strcspn(want, " \t\r\n")] = 0;
+    snprintf(lang, sizeof lang, "en-US");
+    for (size_t i = 0; want[0] && i < sizeof known / sizeof *known; i++)
+        if (!strcmp(want, known[i])) snprintf(lang, sizeof lang, "%s", known[i]);
+    if (want[0] && strcmp(want, lang)) hos_log("oe: language \"%s\" (%s) is not one TOTK has: English (US)", want, from);
+    else hos_log("oe: language %s (%s)", lang, from);
+    return lang;
+}
 HLE(_ZN2nn2oe18GetDesiredLanguageEv) {
     uint64_t v = 0;
-    memcpy(&v, "en-US", 5);
+    memcpy(&v, desired_language(), strlen(desired_language()));
     RET(v);
 }
 HLE(_ZN2nn2oe16GetOperationModeEv) { RET(1); }        /* OperationMode_Console (docked) */

@@ -54,6 +54,7 @@ The package normally creates its own `user/` directory beside the executable; it
 - **Wrong module or missing RomFS:** check the extracted folder layout and version. A base-game ID match is not a complete integrity check.
 - **Existing output or stale/incomplete lift:** move the indicated package or build directory aside, preserving `user/` first, then retry. An interrupted copy can also leave a nonempty package that needs to be moved aside.
 - **First launch or new scene stutters:** shader translation and pipeline compilation may happen as scenes are encountered. The native pipeline cache helps prepare previously encountered pipelines on later launches; it cannot guarantee stutter-free play.
+- **GPU device lost or wrong GPU:** AMD cards lost the WebGPU device at startup while the GPU ASTC decoder was created (issue #1; fixed). The log now includes wgpu's own warnings and errors (`RX_WGPU_LOG=info|debug|trace` for more, `off` for none). `RX_ADAPTER=<part of the GPU's name>` (for example `RX_ADAPTER=Radeon`) picks a GPU on a PC with two, and `RX_ASTC_CPU=1` decodes ASTC textures on the CPU instead of the GPU.
 - **Crash or graphics issue:** note the game version, hardware, driver, location and settings. The standalone startup test initialized the renderer and loaded the packaged RomFS, but did not verify full gameplay or graphics correctness.
 
 ## Controls and display features
@@ -75,7 +76,9 @@ Focus the game window before using the keys. The renderer briefly reports displa
 
 **Ultrawide:** F6 attempts to adjust the camera and HUD and fill a wider window. It is off by default. A wider-than-16:9 window is needed, but a user reported that F6 stretches the image instead of providing a correctly proportioned wider view. Camera hooks are present, but their behavior in that report has not been resolved or independently verified. F10 stretching alone is not true ultrawide.
 
-Keyboard and mouse controls are experimental. WASD moves, IJKL controls the camera, Space jumps, E is action, Shift or Q is run/cancel, F attacks, Z/R are L/R, C/V are ZL/ZR, Ctrl crouches, Enter is Plus, Tab is Minus and the arrow keys are the D-pad. Click the window to capture the mouse, Esc to release it, and use `-` / `=` to adjust sensitivity. XInput and SDL-supported controllers are also handled; buttons map by physical position.
+Keyboard and mouse controls are experimental. WASD moves, IJKL controls the camera, Space jumps, E is action, Shift or Q is run/cancel, F attacks, Z/R are L/R, C/V are ZL/ZR, Ctrl crouches, Enter is Plus, Tab is Minus and the arrow keys are the D-pad. Click the window to capture the mouse, Esc to release it, and use `-` / `=` to adjust sensitivity. XInput and SDL-supported controllers are also handled; buttons map by physical position, Nintendo controllers included (the right face button is A).
+
+The game speaks English (US) by default. To play in another of its languages, put a `language.txt` next to `SkyboundTOTK.exe` whose first line is one of `ja`, `en-US`, `en-GB`, `fr`, `fr-CA`, `de`, `it`, `es`, `es-419`, `nl`, `ru`, `ko`, `zh-CN` (or `zh-Hans`), `zh-TW` (or `zh-Hant`); the environment variable `HOS_LANGUAGE` does the same. Anything else falls back to English (US).
 
 ### Why WebGPU?
 
@@ -110,7 +113,8 @@ These are reports and investigation notes, not a complete compatibility list. So
 | Shadows / shaders | **Reported** | Shadow shader problems have been reported. The standalone startup log also showed three shader-decoder assertions; their visual effect and relationship to the shadow issue are unknown. |
 | Stretched terrain | **Reported** | Terrain can appear randomly stretched; cause and reproducibility need investigation. |
 | Incorrect terrain textures | **Reported** | Some areas have wrong terrain textures; locations and causes need investigation. |
-| Weapon and shield wheel background | **Reported** | The background can be black instead of blurred. An ability-wheel workaround was recorded earlier, but the weapon/shield behavior has not been verified fixed in standalone Skybound. |
+| Weapon and shield wheel background | **Fixed** | The d-pad quick menus opened over a black background; they now take the ability wheel's 1/30 s step while held (PR #11). |
+| Ultrahand cannot grab | **Reproduced; open** | Aiming Ultrahand at an object outlines it orange and shows "A Grab", but it never turns green and A does not pick it up (issue #9). Reproduced on both GPU paths; the cause is being investigated. |
 | Ultrawide | **Unresolved** | F6 has been reported to stretch the image instead of providing a correctly proportioned wider view. The exact failure is unknown. |
 | Zonai Portable Pot particles | **Workaround; retest** | A workaround greatly reduced disappearing-effect spikes in an earlier build, but short stray lines remained and the underlying cause is unknown. Retest in Skybound. |
 | Depths gloom | **Earlier fix; retest** | Missing or incorrect ground gloom was reported on the path to Ganon. Earlier notes record a fix for a reproduced case; standalone Skybound and other locations need verification. |

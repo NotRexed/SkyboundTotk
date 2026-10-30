@@ -9,10 +9,13 @@
        -> the final mix (volume) -> the device sink (its channel map, down to stereo) -> waveOut
    and signals the renderer event the game's audio thread waits on. Effects are accepted and left out (dry signal);
    aux effects pass through. Played sample counts and released wave buffers go back to the game as on hardware.
+   The game's parameter changes take effect together at RequestUpdateAudioRenderer, and volume changes ramp over a
+   frame, as the console's renderer does them (see "parameter updates").
    HOS_AUDIO_DUMP=<file.wav>: also write what is played (checking without speakers); HOS_AUDIO=0: silence. */
 #include "hos.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -40,7 +43,7 @@ enum { DEST_NONE, DEST_MIX, DEST_SPLITTER };
 typedef struct { uint64_t buffer, size; int32_t start, end; int loop; uint64_t context; } WB;
 
 typedef struct {
-    int used, final_mix, buffers;
+    int used, released, final_mix, buffers;    /* (released: by the game, until the next update applies it) */
     float volume;
     int dest_kind, dest;                       /* (sub mixes) */
     float to[MAX_BUF][MAX_BUF];                /* [src buffer][dst buffer] volume to the destination mix */
@@ -49,22 +52,25 @@ typedef struct {
 } Mix;
 
 typedef struct {
-    int used, channels, dests;
+    int used, released, channels, dests;
     int dest_mix[MAX_SPLIT_DESTS];
     float vol[MAX_SPLIT_DESTS][MAX_CH][MAX_BUF];
+    float ramp[MAX_SPLIT_DESTS][MAX_CH][MAX_BUF];   /* the volumes the last frame ended with */
 } Splitter;
 
 typedef struct {
-    int used, rate, channels, format, state;
+    int used, released, rate, channels, format, state;
     uint64_t guest, param;                     /* the VoiceType; AdpcmParameter */
     int16_t coefs[16];                         /* ADPCM coefficients, copied when acquired (the game reuses the
                                                   parameter memory) */
     float volume, pitch;
     int dest_kind, dest;
     float vol[MAX_CH][MAX_BUF];                /* to the destination mix */
+    float ramp_volume, ramp_vol[MAX_CH][MAX_BUF];   /* the volumes the last frame ended with (ramped to the above) */
+    int snap;                                  /* started or a new destination: no ramp from the old volumes */
     uint64_t wb[MAX_WB];                       /* queued WaveBuffer*, oldest first (their identity) */
     WB wbc[MAX_WB];                            /* and their contents when appended */
-    int nwb;
+    int nwb, pending_wb;                       /* (pending: appended, not yet applied by an update) */
     uint64_t rel[MAX_REL];                     /* released, for GetReleasedWaveBuffer */
     int nrel;
     int64_t played;
@@ -110,21 +116,31 @@ static float farg(Ctx *c, int n) {
     memcpy(&f, &c->vreg[n][0], 4);
     return f;
 }
-static Voice *voice_of(uint64_t obj) {
+/* The game's objects, by the handle in their first word; what the game released (until an update applies it) no
+   longer counts. */
+static int voice_index(uint64_t obj) {
     const int i = get_handle(obj, K_VOICE);
-    return i >= 0 && i < MAX_VOICES && voices[i].used ? &voices[i] : NULL;
+    return i >= 0 && i < MAX_VOICES && voices[i].used && !voices[i].released ? i : -1;
 }
-static Mix *mix_of(uint64_t obj) {
-    const int i = get_handle(obj, K_MIX);
-    return i >= 0 && i < MAX_MIXES && mixes[i].used ? &mixes[i] : NULL;
+static Voice *voice_of(uint64_t obj) {
+    const int i = voice_index(obj);
+    return i >= 0 ? &voices[i] : NULL;
 }
 static int mix_index(uint64_t obj) {
     const int i = get_handle(obj, K_MIX);
-    return i >= 0 && i < MAX_MIXES && mixes[i].used ? i : -1;
+    return i >= 0 && i < MAX_MIXES && mixes[i].used && !mixes[i].released ? i : -1;
+}
+static Mix *mix_of(uint64_t obj) {
+    const int i = mix_index(obj);
+    return i >= 0 ? &mixes[i] : NULL;
+}
+static int splitter_index(uint64_t obj) {
+    const int i = get_handle(obj, K_SPLITTER);
+    return i >= 0 && i < MAX_SPLITTERS && splitters[i].used && !splitters[i].released ? i : -1;
 }
 static Splitter *splitter_of(uint64_t obj) {
-    const int i = get_handle(obj, K_SPLITTER);
-    return i >= 0 && i < MAX_SPLITTERS && splitters[i].used ? &splitters[i] : NULL;
+    const int i = splitter_index(obj);
+    return i >= 0 ? &splitters[i] : NULL;
 }
 
 /* ---- wave buffers ---------------------------------------------------------------------------------------------
@@ -307,6 +323,7 @@ static void reverb_frame(Reverb *rv, Mix *m) {
             if (b >= 0 && b < m->buffers) x += m->buf[b][i];
         }
         x /= (float)rv->n;
+        if (!isfinite(x)) x = 0;   /* (a NaN would stay in the feedback lines for good) */
         rv->pre[rv->pre_pos] = x;
         float er = 0;
         for (int t = 0; t < 6; t++)
@@ -344,9 +361,18 @@ static void effects_frame(int mix) {
 static void render_voice(Voice *v) {
     /* (a started voice without a destination still plays, as on the DSP: its buffers run out and are released) */
     if (v->state != PLAY_STARTED) return;
+    if (v->snap) {   /* (just started, or a new destination: its volumes at once) */
+        v->snap = 0;
+        v->ramp_volume = v->volume;
+        memcpy(v->ramp_vol, v->vol, sizeof v->ramp_vol);
+        if (v->dest_kind == DEST_SPLITTER && splitters[v->dest].used)
+            memcpy(splitters[v->dest].ramp, splitters[v->dest].vol, sizeof splitters[v->dest].ramp);
+    }
     const double step = (double)v->rate * (v->pitch > 0 ? v->pitch : 1.0) / RATE;
     float out[MAX_CH][FRAME];
     int any = 0;
+    /* volumes ramp from the last frame's to the new ones over the frame, as the console's DSP does (a jump clicks) */
+    const float vol0 = v->ramp_volume, dvol = (v->volume - v->ramp_volume) / FRAME;
     for (int i = 0; i < FRAME; i++) {
         v->frac += step;
         while (v->frac >= 1.0) {
@@ -355,9 +381,10 @@ static void render_voice(Voice *v) {
             if (!next_source_frame(v)) memset(v->cur, 0, sizeof v->cur);
             else any = 1;
         }
-        const float t = (float)v->frac;
-        for (int ch = 0; ch < v->channels; ch++) out[ch][i] = (v->prev[ch] + (v->cur[ch] - v->prev[ch]) * t) * v->volume;
+        const float t = (float)v->frac, gain = vol0 + dvol * (float)(i + 1);
+        for (int ch = 0; ch < v->channels; ch++) out[ch][i] = (v->prev[ch] + (v->cur[ch] - v->prev[ch]) * t) * gain;
     }
+    v->ramp_volume = v->volume;
     (void)any;
     /* the biquad filters (transposed direct form II, as the DSP's) */
     for (int f = 0; f < 2; f++) {
@@ -371,34 +398,39 @@ static void render_voice(Voice *v) {
                 z1 = b2 * x + a2 * y;
                 out[ch][i] = y;
             }
+            if (!isfinite(z0) || !isfinite(z1)) {   /* (blown up: silence and start over rather than a full-scale burst) */
+                z0 = z1 = 0;
+                memset(out[ch], 0, sizeof out[ch]);
+            }
             v->bq_z[f][ch][0] = z0;
             v->bq_z[f][ch][1] = z1;
         }
     }
-    if (v->dest_kind == DEST_MIX) {
+    if (v->dest_kind == DEST_MIX && mixes[v->dest].used) {
         Mix *m = &mixes[v->dest];
-        if (!m->used) return;
         for (int ch = 0; ch < v->channels; ch++)
             for (int b = 0; b < m->buffers; b++) {
-                const float g = v->vol[ch][b];
-                if (g == 0.0f) continue;
-                for (int i = 0; i < FRAME; i++) m->buf[b][i] += out[ch][i] * g;
+                const float g0 = v->ramp_vol[ch][b], g1 = v->vol[ch][b];
+                if (g0 == 0.0f && g1 == 0.0f) continue;
+                const float dg = (g1 - g0) / FRAME;
+                for (int i = 0; i < FRAME; i++) m->buf[b][i] += out[ch][i] * (g0 + dg * (float)(i + 1));
             }
-    } else if (v->dest_kind == DEST_SPLITTER) {
+    } else if (v->dest_kind == DEST_SPLITTER && splitters[v->dest].used) {
         Splitter *s = &splitters[v->dest];
-        if (!s->used) return;
         for (int d = 0; d < s->dests; d++) {
             const int mi = s->dest_mix[d];
             if (mi < 0 || !mixes[mi].used) continue;
             Mix *m = &mixes[mi];
             for (int ch = 0; ch < v->channels && ch < MAX_CH; ch++)
                 for (int b = 0; b < m->buffers; b++) {
-                    const float g = s->vol[d][ch][b];
-                    if (g == 0.0f) continue;
-                    for (int i = 0; i < FRAME; i++) m->buf[b][i] += out[ch][i] * g;
+                    const float g0 = s->ramp[d][ch][b], g1 = s->vol[d][ch][b];
+                    if (g0 == 0.0f && g1 == 0.0f) continue;
+                    const float dg = (g1 - g0) / FRAME;
+                    for (int i = 0; i < FRAME; i++) m->buf[b][i] += out[ch][i] * (g0 + dg * (float)(i + 1));
                 }
         }
     }
+    memcpy(v->ramp_vol, v->vol, sizeof v->ramp_vol);   /* (splitters catch up in render_frame) */
 }
 
 static int mix_depth(int i, int guard) {   /* how many sub mixes lie between this one and the final mix */
@@ -414,6 +446,10 @@ static void render_frame(int16_t *pcm) {   /* 240 stereo frames */
         }
     for (int i = 0; i < MAX_VOICES; i++)
         if (voices[i].used) render_voice(&voices[i]);
+    for (int i = 0; i < MAX_SPLITTERS; i++)   /* (the splitters' volume ramps: once a frame, whichever voices use them) */
+        if (splitters[i].used)
+            for (int d = 0; d < splitters[i].dests; d++)
+                memcpy(splitters[i].ramp[d], splitters[i].vol[d], sizeof splitters[i].ramp[d]);
     /* sub mixes, deepest first */
     int order[MAX_MIXES], n = 0;
     for (int m = 0; m < MAX_MIXES; m++)
@@ -516,6 +552,8 @@ static void render_frame(int16_t *pcm) {   /* 240 stereo frames */
         }
     for (int i = 0; i < FRAME; i++) {
         float a = l[i] * 32767.0f, b = r[i] * 32767.0f;
+        if (a != a) a = 0;   /* (NaN) */
+        if (b != b) b = 0;
         if (a > 32767) a = 32767;
         if (a < -32768) a = -32768;
         if (b > 32767) b = 32767;
@@ -607,6 +645,125 @@ static void output_frame(const int16_t *pcm) {
     }
 }
 
+/* ---- parameter updates ------------------------------------------------------------------------------------------
+   The game changes a voice's play state, wave buffers, volumes, filters and destination (and its mixes' and
+   splitters') with separate calls, then commits them together with RequestUpdateAudioRenderer; the console's renderer
+   only ever sees whole updates. Applied as each call came, the mixer thread rendered frames between them: a voice
+   started before its volumes were set (1.0, or the previous sound's), or still sent to its old mix, played a short
+   loud blip. The calls queue their change instead (with the arguments copied: TOTK refills the structs it passes),
+   and the update applies the queue under the mixer's lock. Should no update come for 50 ms, the mixer applies the
+   queue itself. Acquisitions stay immediate (they return the object); releases are queued like the rest, the object
+   invalid to the game at once. Objects are queued as our slot indices, looked up when the game calls: the game reuses
+   its VoiceType for the next sound right after releasing it, so its handle names the new voice by the time the
+   update comes (looked up then, a queued release ended the new sound: no footsteps or hits). A released slot stays
+   taken until the update applies the release, so the indices hold for the queue's life.
+   HOS_AUDIO_IMMEDIATE=1: every change applied as it comes (as before). */
+enum { OP_VOICE_RELEASE, OP_VOICE_DEST, OP_VOICE_MIX_VOLUME, OP_VOICE_VOLUME, OP_VOICE_PITCH, OP_VOICE_BIQUAD,
+       OP_VOICE_STATE, OP_VOICE_APPEND, OP_MIX_RELEASE, OP_MIX_VOLUME, OP_MIX_DEST, OP_MIX_MIX_VOLUME, OP_SPLIT_RELEASE,
+       OP_SPLIT_DEST, OP_SPLIT_VOLUME };
+typedef struct {
+    int op, idx, tgt;          /* our voice / mix / splitter; a destination mix or splitter (-1: none) */
+    int i0, i1, i2;            /* (op-specific: a kind, an index, channels, a state) */
+    uint64_t wbp;              /* an appended WaveBuffer's identity */
+    float f, b[3], a[2];
+    WB wb;
+} Cmd;
+static Cmd *cmds;
+static int ncmds, cmds_cap;
+static int64_t last_update_ns;
+
+static void apply(const Cmd *k) {   /* (with the lock held) */
+    if (k->op <= OP_VOICE_APPEND) {
+        Voice *v = &voices[k->idx];
+        if (!v->used) return;
+        switch (k->op) {
+        case OP_VOICE_RELEASE: v->used = 0; break;
+        case OP_VOICE_DEST:
+            v->dest = k->tgt;
+            v->dest_kind = k->tgt < 0 ? DEST_NONE
+                         : k->i0 == DEST_MIX ? (mixes[k->tgt].used ? DEST_MIX : DEST_NONE)
+                         : k->i0 == DEST_SPLITTER ? (splitters[k->tgt].used ? DEST_SPLITTER : DEST_NONE) : DEST_NONE;
+            v->snap = 1;
+            break;
+        case OP_VOICE_MIX_VOLUME: v->vol[k->i0][k->i1] = k->f; break;
+        case OP_VOICE_VOLUME: v->volume = k->f; break;
+        case OP_VOICE_PITCH: v->pitch = k->f; break;
+        case OP_VOICE_BIQUAD:
+            if (k->i1 && !v->bq_on[k->i0]) memset(v->bq_z[k->i0], 0, sizeof v->bq_z[k->i0]);
+            v->bq_on[k->i0] = k->i1;
+            memcpy(v->bq_b[k->i0], k->b, sizeof k->b);
+            memcpy(v->bq_a[k->i0], k->a, sizeof k->a);
+            break;
+        case OP_VOICE_STATE:
+            if (k->i0 == PLAY_STOPPED && v->state != PLAY_STOPPED) {   /* stopped: every queued buffer is released */
+                for (int i = 0; i < v->nwb; i++) release_wb(v, v->wb[i]);
+                v->nwb = 0;
+                v->started_wb = 0;
+                v->frac = 0;
+                memset(v->prev, 0, sizeof v->prev);
+                memset(v->cur, 0, sizeof v->cur);
+                v->yn1 = v->yn2 = 0;
+            }
+            if (k->i0 == PLAY_STARTED && v->state != PLAY_STARTED) v->snap = 1;
+            v->state = k->i0;
+            break;
+        case OP_VOICE_APPEND:
+            if (v->pending_wb > 0) v->pending_wb--;
+            if (v->nwb < MAX_WB) {
+                v->wbc[v->nwb] = k->wb;
+                v->wb[v->nwb++] = k->wbp;
+            } else {
+                release_wb(v, k->wbp);
+            }
+            break;
+        }
+        return;
+    }
+    const int tgt_mix = k->tgt >= 0 && k->tgt < MAX_MIXES && mixes[k->tgt].used ? k->tgt : -1;
+    if (k->op <= OP_MIX_MIX_VOLUME) {
+        Mix *m = &mixes[k->idx];
+        if (!m->used) return;
+        switch (k->op) {
+        case OP_MIX_RELEASE:
+            m->used = 0;
+            if (sink_mix == k->idx) sink_mix = -1;
+            break;
+        case OP_MIX_VOLUME: m->volume = k->f; break;
+        case OP_MIX_DEST:   /* (a sub mix into a splitter: not used by TOTK so far) */
+            m->dest = k->i0 == DEST_MIX ? tgt_mix : -1;
+            m->dest_kind = m->dest >= 0 ? DEST_MIX : DEST_NONE;
+            break;
+        case OP_MIX_MIX_VOLUME: m->to[k->i0][k->i1] = k->f; break;
+        }
+        return;
+    }
+    Splitter *s = &splitters[k->idx];
+    if (!s->used) return;
+    switch (k->op) {
+    case OP_SPLIT_RELEASE: s->used = 0; break;
+    case OP_SPLIT_DEST: s->dest_mix[k->i0] = tgt_mix; break;
+    case OP_SPLIT_VOLUME:
+        s->vol[k->i0][k->i1][k->i2] = k->f;
+        if (s->dest_mix[k->i0] < 0) s->dest_mix[k->i0] = tgt_mix;
+        break;
+    }
+}
+static void submit(const Cmd *k) {   /* (with the lock held) */
+    static int immediate = -1;
+    if (immediate < 0) immediate = getenv("HOS_AUDIO_IMMEDIATE") != NULL;
+    if (ncmds == cmds_cap && !immediate) {
+        const int cap = cmds_cap ? cmds_cap * 2 : 4096;
+        Cmd *grown = (Cmd *)realloc(cmds, (size_t)cap * sizeof *grown);
+        if (grown) cmds = grown, cmds_cap = cap;
+    }
+    if (immediate || ncmds == cmds_cap) apply(k);
+    else cmds[ncmds++] = *k;
+}
+static void commit(void) {   /* (with the lock held) */
+    for (int i = 0; i < ncmds; i++) apply(&cmds[i]);
+    ncmds = 0;
+}
+
 /* ---- the renderer thread --------------------------------------------------------------------------------------- */
 static uint64_t renderer_event;
 static volatile int renderer_running;
@@ -625,6 +782,7 @@ static DWORD WINAPI renderer_main(void *p) {
         if (hos_now_ns() - next > 100000000) next = hos_now_ns() + period;   /* (fell far behind: catch up) */
         if (!renderer_running) continue;
         au_lock();
+        if (ncmds && hos_now_ns() - last_update_ns > 50000000) commit();   /* (no update came: see "parameter updates") */
         render_frame(pcm);
         au_unlock();
         output_frame(pcm);
@@ -649,7 +807,13 @@ HLE(_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11SystemEv
 HLE(_ZN2nn5audio18StartAudioRendererENS0_19AudioRendererHandleE) { renderer_running = 1; RET(0); }
 HLE(_ZN2nn5audio17StopAudioRendererENS0_19AudioRendererHandleE) { renderer_running = 0; }
 HLE(_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE) { renderer_running = 0; renderer_event = 0; dump_finish(); }
-HLE(_ZN2nn5audio26RequestUpdateAudioRendererENS0_19AudioRendererHandleEPKNS0_19AudioRendererConfigE) { RET(0); }
+HLE(_ZN2nn5audio26RequestUpdateAudioRendererENS0_19AudioRendererHandleEPKNS0_19AudioRendererConfigE) {
+    au_lock();
+    commit();
+    last_update_ns = hos_now_ns();
+    au_unlock();
+    RET(0);
+}
 HLE(_ZN2nn5audio33GetAudioRendererElapsedFrameCountEPKNS0_19AudioRendererConfigE) { RET(elapsed_frames); }
 
 /* Sizes the game allocates for the renderer: generous, never touched by us. */
@@ -744,41 +908,36 @@ HLE(_ZN2nn5audio15AcquireFinalMixEPNS0_19AudioRendererConfigEPNS0_12FinalMixType
 HLE(_ZN2nn5audio13AcquireSubMixEPNS0_19AudioRendererConfigEPNS0_10SubMixTypeEii) { RET(new_mix(ARG(1), 0, (int)ARG(3))); }
 static void release_mix(uint64_t obj) {
     au_lock();
-    const int i = mix_index(obj);
-    if (i >= 0) {
-        mixes[i].used = 0;
-        if (sink_mix == i) sink_mix = -1;
+    Mix *m = mix_of(obj);
+    if (m) {
+        m->released = 1;
+        const Cmd k = {.op = OP_MIX_RELEASE, .idx = (int)(m - mixes)};
+        submit(&k);
     }
     au_unlock();
 }
 HLE(_ZN2nn5audio15ReleaseFinalMixEPNS0_19AudioRendererConfigEPNS0_12FinalMixTypeE) { release_mix(ARG(1)); }
 HLE(_ZN2nn5audio13ReleaseSubMixEPNS0_19AudioRendererConfigEPNS0_10SubMixTypeE) { release_mix(ARG(1)); }
-HLE(_ZN2nn5audio17SetFinalMixVolumeEPNS0_12FinalMixTypeEf) {
+static void set_mix_volume(Ctx *c) {
     au_lock();
-    Mix *m = mix_of(ARG(0));
-    if (m) m->volume = farg(c, 0);
+    if (mix_of(ARG(0))) {
+        const Cmd k = {.op = OP_MIX_VOLUME, .idx = mix_index(ARG(0)), .f = farg(c, 0)};
+        submit(&k);
+    }
     au_unlock();
 }
+HLE(_ZN2nn5audio17SetFinalMixVolumeEPNS0_12FinalMixTypeEf) { set_mix_volume(c); }
 HLE(_ZN2nn5audio15SetSubMixVolumeEPNS0_10SubMixTypeEf) {
-    au_lock();
-    Mix *m = mix_of(ARG(0));
-    if (m) m->volume = farg(c, 0);
     AUT("audio: sub mix %d volume %.3f", mix_index(ARG(0)), farg(c, 0));
-    au_unlock();
+    set_mix_volume(c);
 }
 static void set_mix_dest(uint64_t obj, int kind, uint64_t dest) {
     au_lock();
-    Mix *m = mix_of(obj);
     AUT("audio: sub mix %d destination %s %#llx (mix %d, splitter %d)", mix_index(obj), kind == DEST_MIX ? "mix" : "splitter",
         (unsigned long long)dest, mix_index(dest), get_handle(dest, K_SPLITTER));
-    if (m) {
-        if (kind == DEST_MIX) {
-            const int d = mix_index(dest);
-            m->dest_kind = d >= 0 ? DEST_MIX : DEST_NONE;
-            m->dest = d;
-        } else {
-            m->dest_kind = DEST_NONE;   /* (a sub mix into a splitter: not used by TOTK so far) */
-        }
+    if (mix_of(obj)) {
+        const Cmd k = {.op = OP_MIX_DEST, .idx = mix_index(obj), .tgt = kind == DEST_MIX ? mix_index(dest) : -1, .i0 = kind};
+        submit(&k);
     }
     au_unlock();
 }
@@ -791,9 +950,11 @@ HLE(_ZN2nn5audio22ClearSubMixDestinationEPNS0_19AudioRendererConfigEPNS0_10SubMi
 /* SetSubMixMixVolume(SubMixType*, destination, float volume, int src, int dst) */
 static void set_submix_volume(Ctx *c) {
     au_lock();
-    Mix *m = mix_of(ARG(0));
     const int src = (int)ARG(2), dst = (int)ARG(3);
-    if (m && src >= 0 && src < MAX_BUF && dst >= 0 && dst < MAX_BUF) m->to[src][dst] = farg(c, 0);
+    if (mix_of(ARG(0)) && src >= 0 && src < MAX_BUF && dst >= 0 && dst < MAX_BUF) {
+        const Cmd k = {.op = OP_MIX_MIX_VOLUME, .idx = mix_index(ARG(0)), .i0 = src, .i1 = dst, .f = farg(c, 0)};
+        submit(&k);
+    }
     au_unlock();
 }
 HLE(_ZN2nn5audio18SetSubMixMixVolumeEPNS0_10SubMixTypeEPNS0_12FinalMixTypeEfii) { set_submix_volume(c); }
@@ -818,15 +979,21 @@ HLE(_ZN2nn5audio15AcquireSplitterEPNS0_19AudioRendererConfigEPNS0_12SplitterType
 HLE(_ZN2nn5audio15ReleaseSplitterEPNS0_19AudioRendererConfigEPNS0_12SplitterTypeE) {
     au_lock();
     Splitter *s = splitter_of(ARG(1));
-    if (s) s->used = 0;
+    if (s) {
+        s->released = 1;
+        const Cmd k = {.op = OP_SPLIT_RELEASE, .idx = (int)(s - splitters)};
+        submit(&k);
+    }
     au_unlock();
 }
 /* SetSplitterDestination(config, SplitterType*, int destinationIndex, mix) */
 static void set_split_dest(Ctx *c) {
     au_lock();
-    Splitter *s = splitter_of(ARG(1));
     const int d = (int)ARG(2);
-    if (s && d >= 0 && d < MAX_SPLIT_DESTS) s->dest_mix[d] = mix_index(ARG(3));
+    if (splitter_of(ARG(1)) && d >= 0 && d < MAX_SPLIT_DESTS) {
+        const Cmd k = {.op = OP_SPLIT_DEST, .idx = splitter_index(ARG(1)), .tgt = mix_index(ARG(3)), .i0 = d};
+        submit(&k);
+    }
     AUT("audio: splitter %d destination %d = mix %d", get_handle(ARG(1), K_SPLITTER), d, mix_index(ARG(3)));
     au_unlock();
 }
@@ -835,11 +1002,11 @@ HLE(_ZN2nn5audio22SetSplitterDestinationEPNS0_19AudioRendererConfigEPNS0_12Split
 /* SetSplitterMixVolume(SplitterType*, int destinationIndex, mix, float volume, int src, int dst) */
 static void set_split_volume(Ctx *c) {
     au_lock();
-    Splitter *s = splitter_of(ARG(0));
     const int d = (int)ARG(1), src = (int)ARG(3), dst = (int)ARG(4);
-    if (s && d >= 0 && d < MAX_SPLIT_DESTS && src >= 0 && src < MAX_CH && dst >= 0 && dst < MAX_BUF) {
-        s->vol[d][src][dst] = farg(c, 0);
-        if (s->dest_mix[d] < 0) s->dest_mix[d] = mix_index(ARG(2));
+    if (splitter_of(ARG(0)) && d >= 0 && d < MAX_SPLIT_DESTS && src >= 0 && src < MAX_CH && dst >= 0 && dst < MAX_BUF) {
+        const Cmd k = {.op = OP_SPLIT_VOLUME, .idx = splitter_index(ARG(0)), .tgt = mix_index(ARG(2)), .i0 = d, .i1 = src,
+                       .i2 = dst, .f = farg(c, 0)};
+        submit(&k);
     }
     au_unlock();
 }
@@ -895,7 +1062,11 @@ HLE(_ZN2nn5audio16AcquireVoiceSlotEPNS0_19AudioRendererConfigEPNS0_9VoiceTypeEii
 HLE(_ZN2nn5audio16ReleaseVoiceSlotEPNS0_19AudioRendererConfigEPNS0_9VoiceTypeE) {
     au_lock();
     Voice *v = voice_of(ARG(1));
-    if (v) v->used = 0;
+    if (v) {
+        v->released = 1;
+        const Cmd k = {.op = OP_VOICE_RELEASE, .idx = (int)(v - voices)};
+        submit(&k);
+    }
     au_unlock();
 }
 HLE(_ZN2nn5audio12IsVoiceValidEPKNS0_9VoiceTypeE) {
@@ -905,16 +1076,10 @@ HLE(_ZN2nn5audio12IsVoiceValidEPKNS0_9VoiceTypeE) {
 }
 static void set_voice_dest(Ctx *c, int kind) {
     au_lock();
-    Voice *v = voice_of(ARG(1));
-    if (v) {
-        if (kind == DEST_MIX) {
-            v->dest = mix_index(ARG(2));
-            v->dest_kind = v->dest >= 0 ? DEST_MIX : DEST_NONE;
-        } else {
-            const int i = get_handle(ARG(2), K_SPLITTER);
-            v->dest = i;
-            v->dest_kind = i >= 0 && i < MAX_SPLITTERS && splitters[i].used ? DEST_SPLITTER : DEST_NONE;
-        }
+    if (voice_of(ARG(1))) {
+        const Cmd k = {.op = OP_VOICE_DEST, .idx = voice_index(ARG(1)), .i0 = kind,
+                       .tgt = kind == DEST_MIX ? mix_index(ARG(2)) : splitter_index(ARG(2))};
+        submit(&k);
     }
     au_unlock();
     RET(1);
@@ -924,16 +1089,20 @@ HLE(_ZN2nn5audio19SetVoiceDestinationEPNS0_19AudioRendererConfigEPNS0_9VoiceType
 HLE(_ZN2nn5audio19SetVoiceDestinationEPNS0_19AudioRendererConfigEPNS0_9VoiceTypeEPNS0_12SplitterTypeE) { set_voice_dest(c, DEST_SPLITTER); }
 HLE(_ZN2nn5audio21ClearVoiceDestinationEPNS0_19AudioRendererConfigEPNS0_9VoiceTypeE) {
     au_lock();
-    Voice *v = voice_of(ARG(1));
-    if (v) v->dest_kind = DEST_NONE;
+    if (voice_of(ARG(1))) {
+        const Cmd k = {.op = OP_VOICE_DEST, .idx = voice_index(ARG(1)), .tgt = -1, .i0 = DEST_NONE};
+        submit(&k);
+    }
     au_unlock();
 }
 /* SetVoiceMixVolume(VoiceType*, mix, float volume, int src, int dst) */
 static void set_voice_mix_volume(Ctx *c) {
     au_lock();
-    Voice *v = voice_of(ARG(0));
     const int src = (int)ARG(2), dst = (int)ARG(3);
-    if (v && src >= 0 && src < MAX_CH && dst >= 0 && dst < MAX_BUF) v->vol[src][dst] = farg(c, 0);
+    if (voice_of(ARG(0)) && src >= 0 && src < MAX_CH && dst >= 0 && dst < MAX_BUF) {
+        const Cmd k = {.op = OP_VOICE_MIX_VOLUME, .idx = voice_index(ARG(0)), .i0 = src, .i1 = dst, .f = farg(c, 0)};
+        submit(&k);
+    }
     au_unlock();
 }
 HLE(_ZN2nn5audio17SetVoiceMixVolumeEPNS0_9VoiceTypeEPNS0_10SubMixTypeEfii) { set_voice_mix_volume(c); }
@@ -943,14 +1112,17 @@ HLE(_ZN2nn5audio14SetVoiceVolumeEPNS0_9VoiceTypeEf) {
     Voice *v = voice_of(ARG(0));
     if (v) {
         if (v->volume != farg(c, 0)) AUT("audio: voice %d volume %.3f", (int)(v - voices), farg(c, 0));
-        v->volume = farg(c, 0);
+        const Cmd k = {.op = OP_VOICE_VOLUME, .idx = (int)(v - voices), .f = farg(c, 0)};
+        submit(&k);
     }
     au_unlock();
 }
 HLE(_ZN2nn5audio13SetVoicePitchEPNS0_9VoiceTypeEf) {
     au_lock();
-    Voice *v = voice_of(ARG(0));
-    if (v) v->pitch = farg(c, 0);
+    if (voice_of(ARG(0))) {
+        const Cmd k = {.op = OP_VOICE_PITCH, .idx = voice_index(ARG(0)), .f = farg(c, 0)};
+        submit(&k);
+    }
     au_unlock();
 }
 HLE(_ZN2nn5audio16SetVoicePriorityEPNS0_9VoiceTypeEi) {}
@@ -961,16 +1133,12 @@ HLE(_ZN2nn5audio29SetVoiceBiquadFilterParameterEPNS0_9VoiceTypeEiRKNS0_21BiquadF
     const int f = (int)ARG(1);
     if (v && f >= 0 && f < 2 && ARG(2)) {
         const uint64_t p = ARG(2);
-        const int on = *(uint8_t *)GP(p) != 0;
-        float b[3], a[2];
-        for (int k = 0; k < 3; k++) b[k] = *(int16_t *)GP(p + 2 + 2 * k) / 16384.0f;
-        for (int k = 0; k < 2; k++) a[k] = *(int16_t *)GP(p + 8 + 2 * k) / 16384.0f;
-        if (on && !v->bq_on[f]) memset(v->bq_z[f], 0, sizeof v->bq_z[f]);
-        v->bq_on[f] = on;
-        memcpy(v->bq_b[f], b, sizeof b);
-        memcpy(v->bq_a[f], a, sizeof a);
+        Cmd k = {.op = OP_VOICE_BIQUAD, .idx = (int)(v - voices), .i0 = f, .i1 = *(uint8_t *)GP(p) != 0};
+        for (int n = 0; n < 3; n++) k.b[n] = *(int16_t *)GP(p + 2 + 2 * n) / 16384.0f;
+        for (int n = 0; n < 2; n++) k.a[n] = *(int16_t *)GP(p + 8 + 2 * n) / 16384.0f;
+        submit(&k);
         static int logged;
-        if (on && logged++ < 8) AUT("audio: voice biquad %d: b %.3f %.3f %.3f a %.3f %.3f", f, b[0], b[1], b[2], a[0], a[1]);
+        if (k.i1 && logged++ < 8) AUT("audio: voice biquad %d: b %.3f %.3f %.3f a %.3f %.3f", f, k.b[0], k.b[1], k.b[2], k.a[0], k.a[1]);
     }
     au_unlock();
 }
@@ -980,17 +1148,9 @@ HLE(_ZN2nn5audio17SetVoicePlayStateEPNS0_9VoiceTypeENS1_9PlayStateE) {
     Voice *v = voice_of(ARG(0));
     if (v) {
         const int s = (int)ARG(1);
-        if (s == PLAY_STOPPED && v->state != PLAY_STOPPED) {   /* stopped: every queued buffer is released */
-            for (int k = 0; k < v->nwb; k++) release_wb(v, v->wb[k]);
-            v->nwb = 0;
-            v->started_wb = 0;
-            v->frac = 0;
-            memset(v->prev, 0, sizeof v->prev);
-            memset(v->cur, 0, sizeof v->cur);
-            v->yn1 = v->yn2 = 0;
-        }
         if (v->state != s) AUT("audio: voice %d %s", (int)(v - voices), s == 0 ? "start" : s == 1 ? "stop" : "pause");
-        v->state = s;
+        const Cmd k = {.op = OP_VOICE_STATE, .idx = (int)(v - voices), .i0 = s};
+        submit(&k);
     }
     au_unlock();
 }
@@ -998,7 +1158,7 @@ HLE(_ZN2nn5audio16AppendWaveBufferEPNS0_9VoiceTypeEPKNS0_10WaveBufferE) {
     au_lock();
     Voice *v = voice_of(ARG(0));
     int ok = 0;
-    if (v && v->nwb < MAX_WB) {
+    if (v && v->nwb + v->pending_wb < MAX_WB) {
         {   /* HOS_AUDIO_WB_DUMP=<dir>: the first 40 wave buffers' data and the voice's coefficients (debugging) */
             static const char *dir;
             static int init, nd;
@@ -1016,8 +1176,9 @@ HLE(_ZN2nn5audio16AppendWaveBufferEPNS0_9VoiceTypeEPKNS0_10WaveBufferE) {
                 }
             }
         }
-        v->wbc[v->nwb] = read_wb(ARG(1));
-        v->wb[v->nwb++] = ARG(1);
+        const Cmd k = {.op = OP_VOICE_APPEND, .idx = (int)(v - voices), .wbp = ARG(1), .wb = read_wb(ARG(1))};
+        v->pending_wb++;
+        submit(&k);
         ok = 1;
         static int logged;
         if (logged++ < 8) {
@@ -1045,7 +1206,7 @@ HLE(_ZN2nn5audio21GetReleasedWaveBufferEPNS0_9VoiceTypeE) {
 HLE(_ZN2nn5audio18GetWaveBufferCountEPKNS0_9VoiceTypeE) {
     au_lock();
     Voice *v = voice_of(ARG(0));
-    RET(v ? v->nwb : 0);
+    RET(v ? v->nwb + v->pending_wb : 0);
     au_unlock();
 }
 HLE(_ZN2nn5audio25GetVoicePlayedSampleCountEPKNS0_9VoiceTypeE) {

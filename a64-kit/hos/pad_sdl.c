@@ -108,6 +108,9 @@ static DWORD WINAPI pad_main(void *arg) {
     sdl.SetHint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
     sdl.SetHint("SDL_JOYSTICK_HIDAPI_PS5_RUMBLE", "1");
     sdl.SetHint("SDL_JOYSTICK_HIDAPI_PS4_RUMBLE", "1");
+    /* (the map below is by position; SDL2 reports Nintendo pads by their labels unless told not to, which put a Switch Pro
+       Controller's A, on the right, at the bottom button's place: A acted as B and X as Y: SkyboundTotk issue 12) */
+    sdl.SetHint("SDL_GAMECONTROLLER_USE_BUTTON_LABELS", "0");
     if (sdl.Init(SDL_INIT_GAMECONTROLLER) != 0) {
         hos_log("hid: SDL could not start its controller support: %s", sdl.GetError());
         return 0;

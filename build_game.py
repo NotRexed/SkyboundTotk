@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import logging
 
 ROOT = Path(__file__).resolve().parent
 GAME = ROOT / "game"
@@ -20,7 +21,25 @@ EXPECTED_IDS = {
 }
 
 
+def setup_logging():
+    log_file = ROOT / "build.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_file, encoding="utf-8")
+        ]
+    )
+    logging.info("=== build started ===")
+
+
+def log_and_print(message):
+    print(message, flush=True)
+    logging.info(message)
+
+
 def fail(message):
+    logging.error(message)
     raise SystemExit("ERROR: " + message)
 
 
@@ -101,8 +120,27 @@ def check_tools():
 
 
 def run(*args):
-    print("\n==", " ".join(str(x) for x in args), flush=True)
-    subprocess.run([str(x) for x in args], check=True, cwd=ROOT)
+    cmd_str = " ".join(str(x) for x in args)
+    log_and_print(f"\n== {cmd_str}")
+    
+    process = subprocess.Popen(
+        [str(x) for x in args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        cwd=ROOT,
+        bufsize=1,
+        universal_newlines=True
+    )
+
+    for line in process.stdout:
+        print(line, end="", flush=True)
+        logging.info(line.rstrip("\n"))
+
+    process.wait()
+    if process.returncode != 0:
+        logging.error(f"Command failed with exit code {process.returncode}")
+        raise subprocess.CalledProcessError(process.returncode, process.args)
 
 
 def lift_identity(exefs):
@@ -140,12 +178,13 @@ def package(romfs):
         if not src.is_file():
             fail(f"Required build output is missing: {src}")
         shutil.copy2(src, DIST / name)
-    print(f"Copying RomFS to {DIST / 'romfs'}; this may take several minutes.", flush=True)
+    log_and_print(f"Copying RomFS to {DIST / 'romfs'}; this may take several minutes.")
     shutil.copytree(romfs, DIST / "romfs", symlinks=False)
-    print(f"\nBuild complete. Open {DIST / 'SkyboundTOTK.exe'} to play.")
+    log_and_print(f"\nBuild complete. Open {DIST / 'SkyboundTOTK.exe'} to play.")
 
 
 def main():
+    setup_logging()
     exefs, romfs = check_game()
     check_tools()
     # A matching completed lift is reusable; changed inputs or an interrupted lift need a fresh directory.
@@ -154,12 +193,13 @@ def main():
     image = BUILD / "totk/image/image.json"
     generated = BUILD / "totk/gen"
     complete = image.is_file() and (generated / "a64_suyu.h").is_file() and any(generated.glob("code_*.c"))
+    
     if complete and stamp.is_file() and stamp.read_text(encoding="ascii").strip() == identity:
         with image.open(encoding="utf-8") as f:
             modules = {m["name"]: m["build_id"] for m in json.load(f)["modules"]}
         if any(modules.get(name) != build_id for name, build_id in EXPECTED_IDS.items()):
             fail("Existing build contains a different game version. Move the build folder aside before retrying.")
-        print("Reusing the existing lifted base-game code.", flush=True)
+        log_and_print("Reusing the existing lifted base-game code.")
     else:
         if BUILD.exists() and any(BUILD.iterdir()):
             fail("Build inputs changed or the lift is incomplete. Move the build folder aside before rebuilding.")
@@ -185,5 +225,6 @@ if __name__ == "__main__":
     try:
         main()
     except subprocess.CalledProcessError as error:
+        logging.error(f"ERROR: command failed with exit code {error.returncode}")
         print(f"ERROR: command failed with exit code {error.returncode}", file=sys.stderr)
         sys.exit(error.returncode or 1)
